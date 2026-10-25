@@ -1,0 +1,12 @@
+# Core API and Data Schemas
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pydantic>=2.6.0
+python-dotenv>=1.0.0
+
+# Web Retrieval and HTML Parsing
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+
+# Testing and Code Quality
+pytest>=8.0.0

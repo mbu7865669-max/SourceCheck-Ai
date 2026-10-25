@@ -1,0 +1,66 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.4, pytest-9.1.1, pluggy-1.7.0 -- C:\Users\Hp\AppData\Local\Python\pythoncore-3.14-64\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Hp\Desktop\SourceCheck-Ai
+plugins: anyio-4.14.2
+collecting ... collected 54 items
+
+tests/test_agent.py::TestAgentOrchestration::test_contradictory_evidence_handling PASSED [  1%]
+tests/test_agent.py::TestAgentOrchestration::test_evidence_insufficient_to_answer PASSED [  3%]
+tests/test_agent.py::TestAgentOrchestration::test_invalid_or_empty_question PASSED [  5%]
+tests/test_agent.py::TestAgentOrchestration::test_model_runtime_error_handled_gracefully PASSED [  7%]
+tests/test_agent.py::TestAgentOrchestration::test_model_timeout_handled_gracefully PASSED [  9%]
+tests/test_agent.py::TestAgentOrchestration::test_no_search_results PASSED [ 11%]
+tests/test_agent.py::TestAgentOrchestration::test_prompt_injection_defense PASSED [ 12%]
+tests/test_agent.py::TestAgentOrchestration::test_stable_structured_output_schema PASSED [ 14%]
+tests/test_agent.py::TestAgentOrchestration::test_successful_end_to_end_orchestration PASSED [ 16%]
+tests/test_agent.py::TestAgentOrchestration::test_unsupported_citations_and_invented_urls_stripped PASSED [ 18%]
+tests/test_extractor.py::TestTextSplitting::test_discard_short_boilerplate_noise PASSED [ 20%]
+tests/test_extractor.py::TestTextSplitting::test_empty_and_whitespace_text PASSED [ 22%]
+tests/test_extractor.py::TestTextSplitting::test_split_long_paragraph_into_clusters PASSED [ 24%]
+tests/test_extractor.py::TestTextSplitting::test_split_normal_paragraphs PASSED [ 25%]
+tests/test_extractor.py::TestTextSplitting::test_within_page_deduplication PASSED [ 27%]
+tests/test_extractor.py::TestRelevanceRanking::test_exact_query_phrase_bonus PASSED [ 29%]
+tests/test_extractor.py::TestRelevanceRanking::test_keyword_overlap_ranking PASSED [ 31%]
+tests/test_extractor.py::TestRelevanceRanking::test_phrase_match_bonus PASSED [ 33%]
+tests/test_extractor.py::TestRelevanceRanking::test_stable_tie_breaking PASSED [ 35%]
+tests/test_extractor.py::TestRelevanceRanking::test_unicode_and_punctuation_handling PASSED [ 37%]
+tests/test_extractor.py::TestRelevanceRanking::test_zero_keyword_overlap PASSED [ 38%]
+tests/test_extractor.py::TestEvidenceExtractionPipeline::test_cross_page_deduplication PASSED [ 40%]
+tests/test_extractor.py::TestEvidenceExtractionPipeline::test_empty_and_failed_pages_handling PASSED [ 42%]
+tests/test_extractor.py::TestEvidenceExtractionPipeline::test_extract_evidence_normal_flow PASSED [ 44%]
+tests/test_extractor.py::TestEvidenceExtractionPipeline::test_limits_enforced PASSED [ 46%]
+tests/test_extractor.py::TestEvidenceExtractionPipeline::test_question_with_no_matches_in_pages PASSED [ 48%]
+tests/test_retrieval.py::TestHtmlCleaning::test_clean_html_empty_and_whitespace PASSED [ 50%]
+tests/test_retrieval.py::TestHtmlCleaning::test_clean_html_fallback_to_h1 PASSED [ 51%]
+tests/test_retrieval.py::TestHtmlCleaning::test_clean_html_malformed PASSED [ 53%]
+tests/test_retrieval.py::TestHtmlCleaning::test_clean_html_standard PASSED [ 55%]
+tests/test_retrieval.py::TestHtmlCleaning::test_clean_html_truncation PASSED [ 57%]
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_invalid_schemes 
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_invalid_schemes PASSED [ 59%]
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_ssrf_blocked_cloud_metadata PASSED [ 61%]
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_ssrf_blocked_decimal_ip PASSED [ 62%]
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_ssrf_blocked_localhost 
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_ssrf_blocked_localhost PASSED [ 64%]
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_ssrf_blocked_private_networks 
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_ssrf_blocked_private_networks PASSED [ 66%]
+tests/test_retrieval.py::TestUrlValidationAndSSRF::test_valid_public_urls PASSED [ 68%]
+tests/test_retrieval.py::TestPageFetching::test_fetch_ssrf_url_blocked_before_request PASSED [ 70%]
+tests/test_retrieval.py::TestPageFetching::test_http_404_error PASSED    [ 72%]
+tests/test_retrieval.py::TestPageFetching::test_http_timeout_error PASSED [ 74%]
+tests/test_retrieval.py::TestPageFetching::test_max_redirects_exceeded PASSED [ 75%]
+tests/test_retrieval.py::TestPageFetching::test_redirect_to_internal_ip_blocked PASSED [ 77%]
+tests/test_retrieval.py::TestPageFetching::test_response_size_limit_exceeded PASSED [ 79%]
+tests/test_retrieval.py::TestPageFetching::test_safe_redirect_followed PASSED [ 81%]
+tests/test_retrieval.py::TestPageFetching::test_successful_page_fetch PASSED [ 83%]
+tests/test_retrieval.py::TestPageFetching::test_unsupported_content_type PASSED [ 85%]
+tests/test_retrieval.py::TestSearchProviders::test_duckduckgo_search_error PASSED [ 87%]
+tests/test_retrieval.py::TestSearchProviders::test_duckduckgo_search_success_mocked PASSED [ 88%]
+tests/test_retrieval.py::TestSearchProviders::test_empty_search_results PASSED [ 90%]
+tests/test_retrieval.py::TestSearchProviders::test_get_search_provider_factory PASSED [ 92%]
+tests/test_retrieval.py::TestSearchProviders::test_mock_search_provider PASSED [ 94%]
+tests/test_retrieval.py::TestEndToEndRetrieval::test_retrieve_pipeline_deduplicates_urls PASSED [ 96%]
+tests/test_retrieval.py::TestEndToEndRetrieval::test_retrieve_pipeline_limits_and_empty_query PASSED [ 98%]
+tests/test_retrieval.py::TestEndToEndRetrieval::test_retrieve_pipeline_with_mock_provider PASSED [100%]
+
+=================== 54 passed, 18 subtests passed in 6.94s ====================
