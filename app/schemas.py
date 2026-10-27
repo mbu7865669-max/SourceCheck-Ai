@@ -80,6 +80,31 @@ class Claim(BaseModel):
     )
 
 
+class AnswerRequest(BaseModel):
+    """Payload accepted by POST /answer (both the agent and the web gateway)."""
+
+    question: str = Field(..., min_length=1, description="Natural-language question to answer")
+    max_search_results: Optional[int] = Field(
+        default=None, ge=1, le=50, description="Override MAX_SEARCH_RESULTS for this request"
+    )
+    max_pages_to_fetch: Optional[int] = Field(
+        default=None, ge=1, le=20, description="Override MAX_PAGES_TO_FETCH for this request"
+    )
+    max_evidence_passages: Optional[int] = Field(
+        default=None, ge=1, le=50, description="Override MAX_EVIDENCE_FOR_MODEL for this request"
+    )
+    model: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Bridge model id for this request (see GET /models), e.g. "
+            "'opencode/mimo-v2.6-flash-free'. Omit to use BRIDGE_MODEL. The bridge "
+            "rejects anything outside its free catalogue."
+        ),
+    )
+
+
 class AgentResponse(BaseModel):
     """Structured response from the SourceCheck AI agent."""
 
@@ -101,6 +126,14 @@ class AgentResponse(BaseModel):
     )
     errors: List[str] = Field(
         default_factory=list, description="Safe diagnostic messages if any pipeline stage encountered an issue"
+    )
+    notices: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Informational, non-fatal notes - e.g. a source that refused the request "
+            "and was skipped. Deliberately separate from `errors` so callers can "
+            "render expected skips calmly."
+        ),
     )
 
 

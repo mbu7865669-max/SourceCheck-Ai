@@ -56,7 +56,7 @@ class TestAgentOrchestration(unittest.TestCase):
                         "claim": "AMD Instinct MI300 is powered by the CDNA 3 architecture.",
                         "url": doc_url,
                         "title": "AMD Instinct MI300 Specs",
-                        "quote": "MI300 is built on CDNA 3 architecture.",
+                        "quote": "The AMD Instinct MI300 series accelerator is powered by the CDNA 3 architecture.",
                     }
                 ],
             }
@@ -75,6 +75,124 @@ class TestAgentOrchestration(unittest.TestCase):
         self.assertEqual(response.sources, [doc_url])
         self.assertEqual(len(response.claims), 1)
         self.assertEqual(response.claims[0].citations[0].url, doc_url)
+
+    def test_malformed_model_claims_do_not_crash(self) -> None:
+        """Some free models return claims as strings / non-lists; that must not 500."""
+        doc_url = "https://example.org/moon"
+        question = "What year did the first human walk on the Moon?"
+        search_provider = MockSearchProvider({
+            question: [SearchResult(title="Moon landing", url=doc_url, snippet="1969")]
+        })
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            html = "<html><body><p>Neil Armstrong walked on the Moon in 1969 during Apollo 11.</p></body></html>"
+            return httpx.Response(200, text=html)
+
+        for claims in (["Armstrong walked on the Moon in 1969."], "1969", None, [42, None]):
+            with self.subTest(claims=claims):
+                mock_llm = MockLLM(predefined_answers={
+                    question: {"answer": "1969", "insufficient_evidence": False, "claims": claims}
+                })
+                agent = SourceCheckAgent(
+                    model=mock_llm,
+                    search_provider=search_provider,
+                    http_client=httpx.Client(transport=httpx.MockTransport(mock_handler)),
+                )
+                response = agent.answer_question(question)
+                self.assertIsInstance(response, AgentResponse)
+                self.assertNotEqual(response.status, "error")
+                for claim in response.claims:
+                    self.assertIsInstance(claim.claim, str)
+
+    def _verify_case(self, claim: str, quote: str, answer: str = "answer") -> AgentResponse:
+        url = "https://example.org/moon"
+        question = "What year did the first human walk on the Moon?"
+        page = (
+            "<html><head><title>Apollo 11</title></head><body><main>"
+            "<p>Neil Armstrong became the first person to walk on the Moon in 1969, "
+            "during the Apollo 11 mission.</p></main></body></html>"
+        )
+        agent = SourceCheckAgent(
+            model=MockLLM(predefined_answers={question: {
+                "answer": answer, "insufficient_evidence": False,
+                "claims": [{"claim": claim, "url": url, "quote": quote}],
+            }}),
+            search_provider=MockSearchProvider({question: [SearchResult(title="Apollo 11", url=url, snippet="")]}),
+            http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=page))),
+        )
+        return agent.answer_question(question)
+
+    def test_verified_claim_needs_quote_from_page(self) -> None:
+        ok = self._verify_case(
+            "Neil Armstrong walked on the Moon in 1969.",
+            "Neil Armstrong became the first person to walk on the Moon in 1969",
+            answer="1969",
+        )
+        self.assertEqual(ok.status, "success")
+        self.assertEqual(len(ok.claims), 1)
+
+        # A quote that is not on the page is never shown: a true claim gets the
+        # real supporting sentence instead, an unsupported one is dropped.
+        invented = self._verify_case("Armstrong walked on the Moon in 1969.", "Armstrong landed in 1969 aboard Eagle")
+        self.assertEqual(invented.status, "success")
+        shown = invented.claims[0].citations[0].quote
+        self.assertNotIn("aboard Eagle", shown)
+        self.assertIn("first person to walk on the Moon in 1969", shown)
+
+        unsupported = self._verify_case("The Eagle module carried a golden record.", "Armstrong landed in 1969 aboard Eagle")
+        self.assertEqual(unsupported.status, "insufficient_evidence")
+        self.assertEqual(unsupported.claims, [])
+
+    def test_quote_must_support_the_claim(self) -> None:
+        # Real quote, unrelated claim (e.g. a model describing itself) -> not verified
+        self_id = self._verify_case(
+            "I am Big Pickle (model ID: big-pickle) from the opencode provider.",
+            "during the Apollo 11 mission",
+        )
+        self.assertEqual(self_id.status, "insufficient_evidence")
+
+        # Real quote, wrong number -> not verified
+        wrong_year = self._verify_case(
+            "Armstrong walked on the Moon in 1972.",
+            "first person to walk on the Moon in 1969",
+        )
+        self.assertEqual(wrong_year.status, "insufficient_evidence")
+
+    def test_string_claims_recover_a_real_quote(self) -> None:
+        """Models that return claims as plain strings ("... (Source 1)") still verify,
+        but only with a sentence actually taken from the page."""
+        url = "https://example.org/moon"
+        question = "What year did the first human walk on the Moon?"
+        page = ("<html><body><main><p>Neil Armstrong became the first person to walk on the Moon "
+                "in 1969, during the Apollo 11 mission.</p><p>Other unrelated text about rockets.</p>"
+                "</main></body></html>")
+
+        def run(claims):
+            agent = SourceCheckAgent(
+                model=MockLLM(predefined_answers={question: {
+                    "answer": "1969", "insufficient_evidence": False, "claims": claims}}),
+                search_provider=MockSearchProvider({question: [SearchResult(title="Apollo", url=url, snippet="")]}),
+                http_client=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, text=page))),
+            )
+            return agent.answer_question(question)
+
+        ok = run(["Neil Armstrong walked on the Moon in 1969 (Source 1)."])
+        self.assertEqual(ok.status, "success")
+        quote = ok.claims[0].citations[0].quote
+        self.assertIn("Neil Armstrong became the first person to walk on the Moon", quote)
+        self.assertNotIn("Source 1", ok.claims[0].claim)
+
+        self.assertEqual(run(["I am Big Pickle (model ID: big-pickle) from the opencode provider."]).status,
+                         "insufficient_evidence")
+        self.assertEqual(run(["Armstrong walked on the Moon in 1972 (Source 1)."]).status,
+                         "insufficient_evidence")
+
+    def test_quote_with_ellipsis_fragments(self) -> None:
+        ok = self._verify_case(
+            "Armstrong walked on the Moon in 1969 on Apollo 11.",
+            "Neil Armstrong became the first person ... walk on the Moon in 1969 ... Apollo 11 mission",
+        )
+        self.assertEqual(ok.status, "success")
 
     def test_invalid_or_empty_question(self) -> None:
         agent = SourceCheckAgent(model=MockLLM())
@@ -275,7 +393,9 @@ class TestAgentOrchestration(unittest.TestCase):
             for cit in claim.citations:
                 self.assertNotEqual(cit.url, hallucinated_url)
 
-        # Fallback should ensure only real_url is cited
+        # No fabricated evidence: the answer abstains and only real_url is listed
+        self.assertEqual(response.status, "insufficient_evidence")
+        self.assertEqual(response.claims, [])
         self.assertEqual(response.sources, [real_url])
 
     def test_prompt_injection_defense(self) -> None:
@@ -317,6 +437,106 @@ class TestAgentOrchestration(unittest.TestCase):
         self.assertIsInstance(response.insufficient_evidence, bool)
         self.assertIn(response.status, ("success", "insufficient_evidence", "error"))
         self.assertIsInstance(response.errors, list)
+        self.assertIsInstance(response.notices, list)  # additive: old clients ignore it
+
+    # ------------------------------------------------------------------
+    # Refused sources (403/429/...) are notices, not errors
+    # ------------------------------------------------------------------
+
+    def test_blocked_source_is_a_notice_not_an_error(self) -> None:
+        """One site refusing us while another answers must not read as a failure."""
+        blocked_url = "https://www.merriam-webster.com/dictionary/hi"
+        good_url = "https://dictionary.cambridge.org/dictionary/english/hi"
+        question = "What does 'hi' mean in English?"
+
+        search_provider = MockSearchProvider({
+            question: [
+                SearchResult(title="Merriam-Webster", url=blocked_url,
+                             snippet="hi - an informal greeting."),
+                SearchResult(title="Cambridge Dictionary", url=good_url,
+                             snippet="hi: used as a friendly greeting."),
+            ]
+        })
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == blocked_url:
+                return httpx.Response(403, text="Forbidden")
+            return httpx.Response(200, text=(
+                "<html><head><title>HI | English meaning</title></head>"
+                "<body><p>Hi is an informal greeting used to say hello to someone.</p></body></html>"
+            ))
+
+        agent = SourceCheckAgent(
+            model=MockLLM(predefined_answers={
+                question: {
+                    "answer": "Hi is an informal greeting used to say hello.",
+                    "insufficient_evidence": False,
+                    "claims": [{
+                        "claim": "Hi is an informal greeting used to say hello.",
+                        "url": good_url,
+                        "title": "HI | English meaning",
+                        "quote": "Hi is an informal greeting used to say hello to someone.",
+                    }],
+                }
+            }),
+            search_provider=search_provider,
+            http_client=httpx.Client(transport=httpx.MockTransport(mock_handler)),
+        )
+
+        response = agent.answer_question(question)
+
+        self.assertEqual(response.status, "success")
+        self.assertEqual(response.errors, [])  # nothing actually went wrong
+        self.assertEqual(len(response.notices), 1)
+        self.assertIn(blocked_url, response.notices[0])
+        self.assertIn("403", response.notices[0])
+        self.assertEqual(response.sources, [good_url])
+
+    def test_hard_fetch_failure_still_reported_as_error(self) -> None:
+        """Only refusals are softened - a 5xx still lands in `errors`."""
+        broken_url = "https://example.com/broken"
+        good_url = "https://example.com/working"
+        question = "What is on the working example page?"
+
+        search_provider = MockSearchProvider({
+            question: [
+                SearchResult(title="Broken", url=broken_url, snippet="broken page"),
+                SearchResult(title="Working", url=good_url, snippet="working page"),
+            ]
+        })
+
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            if str(request.url) == broken_url:
+                return httpx.Response(500, text="boom")
+            return httpx.Response(200, text=(
+                "<html><head><title>Working</title></head>"
+                "<body><p>The working example page contains the answer.</p></body></html>"
+            ))
+
+        agent = SourceCheckAgent(
+            model=MockLLM(predefined_answers={
+                question: {
+                    "answer": "The working example page contains the answer.",
+                    "insufficient_evidence": False,
+                    "claims": [{
+                        "claim": "The working example page contains the answer.",
+                        "url": good_url,
+                        "title": "Working",
+                        "quote": "The working example page contains the answer.",
+                    }],
+                }
+            }),
+            search_provider=search_provider,
+            http_client=httpx.Client(transport=httpx.MockTransport(mock_handler)),
+        )
+
+        response = agent.answer_question(question)
+
+        self.assertEqual(response.notices, [])
+        self.assertTrue(
+            any("Failed to fetch" in err and broken_url in err for err in response.errors),
+            response.errors,
+        )
 
 
 if __name__ == "__main__":

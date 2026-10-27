@@ -19,8 +19,10 @@ from app.retrieval import (
     SecurityError,
     SearchError,
     clean_html,
+    describe_http_status,
     fetch_page,
     get_search_provider,
+    is_blocked_status,
     retrieve,
     search_web,
     validate_url,
@@ -61,6 +63,34 @@ class TestHtmlCleaning(unittest.TestCase):
         self.assertNotIn("color: red", text)
         self.assertNotIn("Home | Docs", text)
         self.assertNotIn("Copyright 2026", text)
+
+    def test_clean_html_drops_menus_and_keeps_paragraphs(self) -> None:
+        html = """
+        <html><head><title>hi | Cambridge Dictionary</title></head><body>
+          <div class="hdr-menu"><ul><li>Translator tool</li><li>Browse</li><li>HFE</li></ul></div>
+          <div id="sidebar"><p>Word of the Day: petrified, extremely frightened. Read More</p></div>
+          <div role="navigation"><a href="/">Home</a></div>
+          <div aria-hidden="true">Log out English (UK) Change</div>
+          <main>
+            <h1>hi</h1>
+            <p>Used as an <b>informal</b> greeting, usually to people who you know.</p>
+            <p>Written abbreviation for Hawaii, used in addresses.</p>
+          </main>
+        </body></html>
+        """
+        _, text = clean_html(html)
+        self.assertIn("Used as an informal greeting, usually to people who you know.", text)
+        self.assertNotIn(" ,", text)
+        self.assertIn("Written abbreviation for Hawaii, used in addresses.", text)
+        for junk in ("Translator tool", "Browse", "Word of the Day", "Home", "Log out"):
+            self.assertNotIn(junk, text)
+        # Paragraphs stay separate so the passage splitter can rank them individually.
+        self.assertIn("people who you know.\n\nWritten abbreviation", text)
+
+    def test_clean_html_without_main_still_separates_blocks(self) -> None:
+        html = "<html><body><div><p>First paragraph here.</p><p>Second paragraph here.</p></div></body></html>"
+        _, text = clean_html(html)
+        self.assertEqual(text, "First paragraph here.\n\nSecond paragraph here.")
 
     def test_clean_html_fallback_to_h1(self) -> None:
         html = "<html><body><h1>Fallback Heading</h1><p>Body text here.</p></body></html>"
@@ -289,6 +319,46 @@ class TestPageFetching(unittest.TestCase):
 
         self.assertFalse(page.success)
         self.assertIn("unsupported content type", page.error.lower())
+
+
+class TestBlockedStatusHandling(unittest.TestCase):
+    """401/403/429/451 mean "you are not welcome here", not "this fetch broke"."""
+
+    def test_blocked_status_classification(self) -> None:
+        for code in (401, 403, 429, 451):
+            self.assertTrue(is_blocked_status(code), code)
+        for code in (200, 404, 418, 500, 503, None):
+            self.assertFalse(is_blocked_status(code), code)
+
+    def test_refusal_wording_for_blocked_statuses(self) -> None:
+        message = describe_http_status(403)
+        self.assertIn("403", message)
+        self.assertIn("refused", message.lower())
+        self.assertNotIn("error", message.lower())
+
+    def test_403_page_is_worded_as_a_refusal(self) -> None:
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(403, text="Forbidden")
+
+        client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+        page = fetch_page("https://www.merriam-webster.com/dictionary/hi", client=client)
+
+        self.assertFalse(page.success)
+        self.assertEqual(page.status_code, 403)
+        self.assertIn("refused", page.error.lower())
+        self.assertIn("403", page.error)
+
+    def test_500_page_keeps_failure_wording(self) -> None:
+        # Ordinary failures must keep sounding like failures - only refusals soften.
+        def mock_handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(500, text="boom")
+
+        client = httpx.Client(transport=httpx.MockTransport(mock_handler))
+        page = fetch_page("https://example.com/broken", client=client)
+
+        self.assertFalse(page.success)
+        self.assertEqual(page.status_code, 500)
+        self.assertIn("returned status 500", page.error)
 
 
 class TestSearchProviders(unittest.TestCase):

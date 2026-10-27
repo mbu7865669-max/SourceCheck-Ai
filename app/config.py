@@ -54,6 +54,14 @@ class Settings:
         self.MAX_NEW_TOKENS: int = int(os.getenv("MAX_NEW_TOKENS", "128"))
         self.TEMPERATURE: float = float(os.getenv("TEMPERATURE", "0.0"))
 
+        # Agent service (the retrieval -> verification -> reasoning pipeline runs in
+        # its own container/process; the web gateway proxies POST /answer to it).
+        self.AGENT_ENDPOINT: str = os.getenv("AGENT_ENDPOINT", "http://127.0.0.1:8001")
+        self.AGENT_PORT: int = int(os.getenv("AGENT_PORT", "8001"))
+        # Generous: a full pipeline run can outlast a single bridge call
+        # (retrieval + evidence + a 120s model budget + retries).
+        self.AGENT_TIMEOUT_SECONDS: float = float(os.getenv("AGENT_TIMEOUT_SECONDS", "240.0"))
+
         # OpenCode Bridge Settings (OpenAI-compatible endpoint backed by the opencode CLI)
         # Served by bridge/opencode_bridge.py - see bridge/README.md.
         self.BRIDGE_ENDPOINT: str = os.getenv("BRIDGE_ENDPOINT", "http://127.0.0.1:18383/v1")

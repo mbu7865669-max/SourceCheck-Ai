@@ -1,0 +1,111 @@
+# =============================================================================
+# SourceCheck AI - container stack (3 services)
+#
+#   web     gateway + Web UI, published on http://localhost
+#           validates input and proxies POST /answer to the agent
+#   agent   the retrieval -> verification -> reasoning pipeline on :8001.
+#           Internal to the compose network: its port is NOT published.
+#   bridge  OpenAI-compatible OpenCode bridge on :18383 that the agent uses
+#           as its model backend (MODEL_PROVIDER=opencode)
+#
+# Startup order is enforced by healthchecks:
+#   bridge healthy  ->  agent starts  ->  agent healthy  ->  web starts
+#
+# Usage:
+#   docker compose up -d --build   # build + start all three services
+#   docker compose ps              # all should report healthy
+#   docker compose run --rm web pytest -q
+#   docker compose down
+# =============================================================================
+# Shared by every service: bounded log files (the default json-file driver grows
+# forever) and a tiny init as PID 1 so signals are forwarded and the bridge's
+# opencode subprocesses get reaped instead of piling up as zombies.
+x-defaults: &defaults
+  init: true
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  web:
+    <<: *defaults
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mbu7865669/sourcecheck-web:1.2.0
+    container_name: sourcecheck-web
+    ports:
+      - "80:8000"
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      HOST: 0.0.0.0
+      PORT: "8000"
+      # Display metadata only (GET /): the pipeline itself runs in the agent.
+      MODEL_PROVIDER: opencode
+      # Where to proxy POST /answer - the agent service, internal network only.
+      AGENT_ENDPOINT: http://agent:8001
+      # One pipeline run can outlast a single bridge call; don't cut it off early.
+      AGENT_TIMEOUT_SECONDS: "240.0"
+    depends_on:
+      agent:
+        condition: service_healthy
+
+  agent:
+    <<: *defaults
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: mbu7865669/sourcecheck-agent:1.2.0
+    container_name: sourcecheck-agent
+    # No `ports:` on purpose - internal only. Reachable from the web gateway
+    # and other compose services as http://agent:8001, not from the host.
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      HOST: 0.0.0.0
+      PORT: "8001"
+      AGENT_PORT: "8001"
+      # Route reasoning through the bridge service below.
+      MODEL_PROVIDER: opencode
+      BRIDGE_ENDPOINT: http://bridge:18383/v1
+      BRIDGE_MODEL: opencode/mimo-v2.6-flash-free
+      BRIDGE_TIMEOUT_SECONDS: "120.0"
+      SEARCH_PROVIDER: duckduckgo
+    depends_on:
+      bridge:
+        condition: service_healthy
+
+  bridge:
+    <<: *defaults
+    build:
+      context: ./bridge
+      dockerfile: Dockerfile
+      args:
+        OPENCODE_VERSION: "2.1.4"
+    image: mbu7865669/sourcecheck-bridge:1.1.0
+    container_name: sourcecheck-bridge
+    ports:
+      - "18383:18383"
+    environment:
+      BRIDGE_HOST: 0.0.0.0
+      BRIDGE_PORT: "18383"
+      OPENCODE_BRIDGE_MODEL: opencode/mimo-v2.6-flash-free
+      # One at a time: free tiers rate-limit, and the agent retries on 429.
+      OPENCODE_BRIDGE_MAX_CONCURRENCY: "1"
+      OPENCODE_BRIDGE_TIMEOUT: "180"
+      OPENCODE_BRIDGE_FREE_ONLY: "1"
+    # Persist OpenCode's session database and config across restarts.
+    # Deliberately NOT mounted at /home/bridge/.opencode: that directory holds the
+    # CLI baked into the image, and a volume there would mask rebuilt versions
+    # (the old binary would keep shadowing the new one).
+    volumes:
+      - bridge-state:/home/bridge/.local/share/opencode
+      - bridge-config:/home/bridge/.config/opencode
+
+volumes:
+  bridge-state:
+  bridge-config:

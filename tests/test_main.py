@@ -1,14 +1,18 @@
 """
-Tests for the application entrypoint (main.py): HTTP routes and CLI argument handling.
+Tests for the web gateway (main.py): HTTP routes and CLI argument handling.
 
-The agent pipeline itself is covered by tests/test_agent.py; here we only verify the
-transport layer around it - routing, validation, status codes, and the fact that
-`python main.py serve` starts a server rather than web-searching the word "serve".
+The gateway proxies POST /answer to the agent service, so the network hop is
+stubbed here and the pipeline itself is covered by tests/test_agent.py; the
+agent's own HTTP surface lives in tests/test_agent_service.py. Here we verify
+the transport layer - routing, validation, status codes, passthrough of the
+agent's errors, and the fact that `python main.py serve` starts a server rather
+than web-searching the word "serve".
 """
 
 import sys
 import types
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -40,48 +44,98 @@ def ok_response(question: str = "What year?") -> AgentResponse:
 
 
 @pytest.fixture
-def patch_agent(monkeypatch):
-    """Replace main.SourceCheckAgent with a factory returning a canned response."""
+def patch_call_agent(monkeypatch):
+    """Replace main._call_agent - the HTTP hop to the agent service.
 
-    def _install(response: AgentResponse, error: Exception | None = None):
-        class FakeAgent:
-            def __init__(self, **kwargs):
-                self.kwargs = kwargs
+    `_install(response=...)` answers with a canned AgentResponse (or raw dict),
+    `_install(error=...)` simulates the agent being unreachable, and the returned
+    object records the payloads that were forwarded for assertions.
+    """
 
-            def answer_question(self, question: str, **kwargs):
-                if error is not None:
-                    raise error
-                return response
+    def _install(
+        response: AgentResponse | dict | None = None,
+        error: Exception | None = None,
+        status_code: int = 200,
+    ):
+        sent: list = []
 
-        monkeypatch.setattr(main, "SourceCheckAgent", FakeAgent)
-        return FakeAgent
+        def _call(payload: dict) -> httpx.Response:
+            sent.append(payload)
+            if error is not None:
+                raise error
+            if response is None:
+                body: dict = ok_response().model_dump()
+            elif isinstance(response, AgentResponse):
+                body = response.model_dump()
+            else:
+                body = response
+            return httpx.Response(status_code, json=body)
+
+        monkeypatch.setattr(main, "_call_agent", _call)
+        return sent
 
     return _install
 
 
 # ------------------------------------------------------------------------------
-# Bridge health URL derivation
+# Agent health URL derivation
 # ------------------------------------------------------------------------------
 
 
-class TestBridgeHealthUrl:
-    def test_strips_v1_suffix(self, monkeypatch):
-        # The OpenAI base ends in /v1, but /health lives at the bridge root.
-        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", "http://127.0.0.1:18383/v1")
-        assert main._bridge_health_url() == "http://127.0.0.1:18383/health"
-
-    def test_no_v1_suffix_left_alone(self, monkeypatch):
-        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", "http://localhost:9000")
-        assert main._bridge_health_url() == "http://localhost:9000/health"
+class TestAgentHealthUrl:
+    def test_appends_health_path(self, monkeypatch):
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "http://agent:8001")
+        assert main._agent_health_url() == "http://agent:8001/health"
 
     def test_trailing_slash_is_normalised(self, monkeypatch):
-        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", "http://127.0.0.1:18383/v1/")
-        assert main._bridge_health_url() == "http://127.0.0.1:18383/health"
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "http://agent:8001/")
+        assert main._agent_health_url() == "http://agent:8001/health"
 
-    def test_v1_in_middle_of_host_is_not_stripped(self, monkeypatch):
-        # Only a *trailing* /v1 is the OpenAI base; one inside the host must survive.
-        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", "http://127.0.0.1:18383/v1beta")
-        assert main._bridge_health_url() == "http://127.0.0.1:18383/v1beta/health"
+
+# ------------------------------------------------------------------------------
+# Agent reachability probe (never raises)
+# ------------------------------------------------------------------------------
+
+
+class TestAgentHealthProbe:
+    def test_reachable_agent_reports_body(self, monkeypatch):
+        # Nothing listens on :1, so this must degrade into reachable=False...
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "http://127.0.0.1:1")
+        state = main._agent_health()
+        assert state["reachable"] is False
+        assert state["endpoint"] == "http://127.0.0.1:1"
+        assert "error" in state
+
+    def test_probe_never_raises(self, monkeypatch):
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "not-a-url")
+        assert isinstance(main._agent_health(), dict)
+
+
+# ------------------------------------------------------------------------------
+# Content negotiation on /
+# ------------------------------------------------------------------------------
+
+
+class TestWantsHtml:
+    """`/` shows the UI to people and metadata to machines - this decides which."""
+
+    @pytest.mark.parametrize(
+        "accept,expected",
+        [
+            # Browsers: HTML first, no JSON type at all.
+            ("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", True),
+            # curl / httpx / TestClient default: not a page request.
+            ("*/*", False),
+            ("application/json", False),
+            ("", False),
+            # Explicit ordering wins when both appear.
+            ("text/html,application/json", True),
+            ("application/json,text/html", False),
+            ("text/html;q=0.9,application/json;q=1.0", False),
+        ],
+    )
+    def test_accept_header_decision(self, accept, expected):
+        assert main.wants_html(accept) is expected
 
 
 # ------------------------------------------------------------------------------
@@ -96,33 +150,147 @@ class TestRoutes:
         assert "answer" in body["endpoints"]
         assert body["model_provider"] == settings.MODEL_PROVIDER
 
-    def test_health_reports_provider(self, client, monkeypatch):
-        monkeypatch.setattr(settings, "MODEL_PROVIDER", "mock")
+    def test_root_points_at_the_ui(self, client):
+        assert client.get("/").json()["ui"] == "/ui"
+
+    def test_root_serves_ui_to_browsers(self, client):
+        # What Chrome/Firefox actually send to a fresh page load.
+        browser = ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                   "image/avif,image/webp,*/*;q=0.8")
+        resp = client.get("/", headers={"accept": browser})
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        assert 'id="question"' in resp.text  # the page (its question box), not metadata
+
+    def test_root_serves_json_to_api_clients(self, client):
+        for accept in ("application/json", "*/*", ""):
+            resp = client.get("/", headers={"accept": accept})
+            assert resp.headers["content-type"].startswith("application/json"), accept
+            assert resp.json()["service"] == "SourceCheck AI"
+
+    def test_ui_serves_the_browser_page(self, client):
+        resp = client.get("/ui")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/html")
+        # The page is the client for this very API, so it must reference both routes.
+        assert "SourceCheck AI" in resp.text
+        assert "/answer" in resp.text
+        assert "/health" in resp.text
+
+    def test_models_come_from_the_agent(self, client, monkeypatch):
+        catalogue = {"provider": "opencode", "default": "opencode/a-free",
+                     "models": ["opencode/a-free", "opencode/b-free"]}
+        monkeypatch.setattr(main, "_fetch_agent_models",
+                            lambda: httpx.Response(200, json=catalogue))
+        assert client.get("/models").json() == catalogue
+
+    def test_models_is_503_when_the_agent_is_down(self, client, monkeypatch):
+        def down():
+            raise httpx.ConnectError("refused")
+
+        monkeypatch.setattr(main, "_fetch_agent_models", down)
+        resp = client.get("/models")
+        assert resp.status_code == 503
+        assert "Agent service unreachable" in resp.json()["detail"]
+
+    def test_answer_forwards_the_chosen_model(self, client, monkeypatch):
+        sent = []
+        monkeypatch.setattr(main, "_call_agent",
+                            lambda payload: sent.append(payload) or httpx.Response(
+                                200, json={"question": "q", "answer": "a"}))
+        client.post("/answer", json={"question": "q", "model": "opencode/b-free"})
+        assert sent[0]["model"] == "opencode/b-free"
+
+    def test_livez_never_probes_the_agent(self, client, monkeypatch):
+        # The container HEALTHCHECK hits /livez every few seconds; it must stay local.
+        def boom():
+            raise AssertionError("/livez must not probe the agent")
+
+        monkeypatch.setattr(main, "_agent_health", boom)
+        resp = client.get("/livez")
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "ok", "service": "web"}
+
+    def test_ui_is_compressed_and_revalidated(self, client):
+        resp = client.get("/ui", headers={"accept-encoding": "gzip"})
+        assert resp.headers["content-encoding"] == "gzip"
+        # Revalidate every load (cheap 304) so a redeploy never leaves a stale UI.
+        assert resp.headers["cache-control"] == "no-cache"
+
+        etag = resp.headers["etag"]
+        again = client.get("/ui", headers={"if-none-match": etag})
+        assert again.status_code == 304
+
+    def test_ui_is_not_exposed_in_openapi(self, client):
+        # It is a page, not an API endpoint - keep the generated schema clean.
+        assert "/ui" not in client.get("/openapi.json").json()["paths"]
+
+    def test_health_reports_agent_view(self, client, monkeypatch):
+        # The gateway merges whatever the agent reports (provider, bridge, ...).
+        monkeypatch.setattr(
+            main,
+            "_agent_health",
+            lambda: {
+                "endpoint": "http://agent:8001",
+                "reachable": True,
+                "body": {"status": "ok", "provider": "mock", "search_provider": "duckduckgo"},
+            },
+        )
         body = client.get("/health").json()
         assert body["status"] == "ok"
+        assert body["service"] == "web"
+        assert body["agent"]["reachable"] is True
         assert body["provider"] == "mock"
-        assert "bridge" not in body  # only probed when provider is opencode
+        assert "bridge" not in body  # agent only probes it when provider is opencode
 
-    def test_health_probes_bridge_for_opencode_provider(self, client, monkeypatch):
-        monkeypatch.setattr(settings, "MODEL_PROVIDER", "opencode")
-        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", "http://127.0.0.1:1/v1")
+    def test_health_merges_bridge_details_from_agent(self, client, monkeypatch):
+        monkeypatch.setattr(
+            main,
+            "_agent_health",
+            lambda: {
+                "endpoint": "http://agent:8001",
+                "reachable": True,
+                "body": {
+                    "provider": "opencode",
+                    "bridge": {"endpoint": "http://bridge:18383/v1", "reachable": True},
+                },
+            },
+        )
         body = client.get("/health").json()
-        assert body["provider"] == "opencode"
-        assert body["bridge"]["reachable"] is False  # nothing listens on :1
-        assert "opencode_bridge.py" in body["bridge"]["hint"]
+        assert body["bridge"]["reachable"] is True
 
-    def test_health_never_500s_when_bridge_is_down(self, client, monkeypatch):
-        monkeypatch.setattr(settings, "MODEL_PROVIDER", "opencode")
-        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", "http://127.0.0.1:1/v1")
+    def test_health_degrades_when_agent_is_down(self, client, monkeypatch):
+        # The gateway itself is alive even when the pipeline is not: report
+        # `degraded` (not a 500) and synthesize the fields the UI pill reads.
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "http://agent:8001")
+        monkeypatch.setattr(
+            main,
+            "_agent_health",
+            lambda: {"endpoint": "http://agent:8001", "reachable": False, "error": "refused"},
+        )
+        body = client.get("/health").json()
+        assert body["status"] == "degraded"
+        assert body["agent"]["reachable"] is False
+        assert body["provider"] == "unknown"
+        assert body["bridge"]["reachable"] is False
+        assert "http://agent:8001" in body["bridge"]["hint"]
+
+    def test_health_never_500s_when_agent_is_down(self, client, monkeypatch):
+        monkeypatch.setattr(
+            main,
+            "_agent_health",
+            lambda: {"endpoint": "http://agent:8001", "reachable": False, "error": "refused"},
+        )
         assert client.get("/health").status_code == 200
 
-    def test_answer_success(self, client, patch_agent):
-        patch_agent(ok_response())
+    def test_answer_success(self, client, patch_call_agent):
+        patch_call_agent(ok_response())
         resp = client.post("/answer", json={"question": "What year?"})
         assert resp.status_code == 200
         body = resp.json()
         assert body["status"] == "success"
         assert body["answer"] == "1969"
+        assert body["notices"] == []  # additive field, always present
 
     def test_answer_rejects_missing_question(self, client):
         resp = client.post("/answer", json={})
@@ -137,41 +305,69 @@ class TestRoutes:
         resp = client.post("/answer", json={"question": "q", "max_search_results": 0})
         assert resp.status_code == 422
 
-    def test_answer_accepts_optional_limits(self, client, patch_agent):
-        patch_agent(ok_response())
+    def test_answer_forwards_optional_limits(self, client, patch_call_agent):
+        sent = patch_call_agent(ok_response())
         resp = client.post(
             "/answer",
             json={"question": "What year?", "max_search_results": 3, "max_pages_to_fetch": 2},
         )
         assert resp.status_code == 200
         assert resp.json()["answer"] == "1969"
+        # The overrides must survive the hop, or the UI's tuning knobs are lies.
+        assert sent[0]["max_search_results"] == 3
+        assert sent[0]["max_pages_to_fetch"] == 2
+        assert "max_evidence_passages" not in sent[0]  # omitted when unset
 
-    def test_model_failure_maps_to_503_with_detail(self, client, patch_agent):
-        from app.model import ModelError
-
-        patch_agent(ok_response(), error=ModelError("OpenCode bridge is not reachable"))
+    def test_model_failure_passes_through_as_503_with_detail(self, patch_call_agent, client):
+        patch_call_agent({"detail": "OpenCode bridge is not reachable"}, status_code=503)
         resp = client.post("/answer", json={"question": "What year?"})
         assert resp.status_code == 503
         assert "not reachable" in resp.json()["detail"]
 
-    def test_model_timeout_maps_to_503(self, client, patch_agent):
-        from app.model import ModelTimeoutError
-
-        patch_agent(ok_response(), error=ModelTimeoutError("timed out after 120s"))
+    def test_model_timeout_passes_through_as_503(self, patch_call_agent, client):
+        patch_call_agent({"detail": "timed out after 120s"}, status_code=503)
         resp = client.post("/answer", json={"question": "What year?"})
         assert resp.status_code == 503
         assert "120s" in resp.json()["detail"]
 
-    def test_unexpected_error_maps_to_500_json(self, client, patch_agent):
-        patch_agent(ok_response(), error=RuntimeError("boom"))
+    def test_agent_crash_passes_through_as_500_json(self, patch_call_agent, client):
+        patch_call_agent({"detail": "Internal agent error"}, status_code=500)
         resp = client.post("/answer", json={"question": "What year?"})
         assert resp.status_code == 500
         assert resp.json()["detail"] == "Internal agent error"
+
+    def test_unreachable_agent_maps_to_503(self, client, patch_call_agent, monkeypatch):
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "http://agent:8001")
+        patch_call_agent(error=httpx.ConnectError("connection refused"))
+        resp = client.post("/answer", json={"question": "What year?"})
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert "unreachable" in detail
+        assert "http://agent:8001" in detail  # names where it tried to go
+
+    def test_agent_timeout_maps_to_503(self, client, patch_call_agent):
+        patch_call_agent(error=httpx.ReadTimeout("timed out"))
+        resp = client.post("/answer", json={"question": "What year?"})
+        assert resp.status_code == 503
+        assert "timed out" in resp.json()["detail"]
+
+    def test_non_json_agent_response_maps_to_502(self, client, monkeypatch):
+        # A broken hop is a bad gateway, not a silent success or a bare 500.
+        monkeypatch.setattr(
+            main, "_call_agent", lambda _payload: httpx.Response(200, text="<html>not json</html>")
+        )
+        resp = client.post("/answer", json={"question": "What year?"})
+        assert resp.status_code == 502
+        assert "agent" in resp.json()["detail"].lower()
 
     def test_error_bodies_are_json_not_html(self, client):
         resp = client.post("/answer", json={})
         assert resp.headers["content-type"].startswith("application/json")
         assert "detail" in resp.json()
+
+    def test_root_names_the_agent_endpoint(self, client, monkeypatch):
+        monkeypatch.setattr(settings, "AGENT_ENDPOINT", "http://agent:8001")
+        assert client.get("/").json()["agent"]["endpoint"] == "http://agent:8001"
 
 
 # ------------------------------------------------------------------------------

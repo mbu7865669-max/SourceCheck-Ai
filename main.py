@@ -1,10 +1,12 @@
 """
-Main application entry point.
+Main application entry point - the web gateway.
 
 Exposes two ways to drive the agent:
 
-* **CLI**  - `python main.py "your question"` for a single ad-hoc query.
-* **HTTP** - a FastAPI service for automated graders and programmatic clients.
+* **CLI**  - `python main.py "your question"` for a single ad-hoc query (in-process).
+* **HTTP** - a FastAPI gateway for automated graders and programmatic clients.
+  `POST /answer` is proxied to the agent service (see `agent_service.py`), which
+  runs the retrieval -> verification -> reasoning pipeline in its own container.
 
 Run the service:
 
@@ -13,32 +15,33 @@ Run the service:
 
 Endpoints:
 
-    GET  /health      liveness + configured model provider + bridge reachability
-    GET  /            service metadata
-    POST /answer      run the full retrieval -> evidence -> reasoning pipeline
+    GET  /health      liveness + agent reachability (+ bridge details via the agent)
+    GET  /            Web UI in a browser, service metadata for API clients
+    GET  /ui          the Web UI, unconditionally
+    POST /answer      proxy to the agent service (AGENT_ENDPOINT, default :8001)
 
-Model selection is driven by `MODEL_PROVIDER` in the environment / `.env`:
-`mock` (offline default), `opencode` (free models via bridge/opencode_bridge.py),
-`local_rocm`, or `local_server`.
+Model selection is driven by `MODEL_PROVIDER` in the environment / `.env` of the
+**agent** service: `mock` (offline default), `opencode` (free models via the
+bridge), `local_rocm`, or `local_server`.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.agent import SourceCheckAgent
 from app.config import settings
-from app.model import ModelError, ModelTimeoutError, get_model
-from app.schemas import AgentResponse
+from app.model import get_model
+from app.schemas import AgentResponse, AnswerRequest
 
 logger = logging.getLogger("sourcecheck")
 
@@ -46,25 +49,67 @@ logger = logging.getLogger("sourcecheck")
 # Keeping them in one place documents the ambiguity instead of hiding it.
 _SERVE_WORDS = frozenset({"serve", "server", "api"})
 
+# Browser UI: one self-contained page served as-is - no template engine, no CDN
+# dependencies, so it works the same in a container with no outbound access to
+# asset hosts.
+_UI_FILE = Path(__file__).resolve().parent / "app" / "static" / "index.html"
 
-# ==============================================================================
-# HTTP request schemas
-# ==============================================================================
+# `no-cache` means "revalidate", not "don't store": browsers keep the page and get
+# a cheap 304 on reload, yet never run a stale UI after a redeploy.
+_UI_HEADERS = {"Cache-Control": "no-cache"}
 
 
-class AnswerRequest(BaseModel):
-    """Payload accepted by POST /answer."""
+def _ui_response(request: Request) -> Response:
+    """Serve the UI, answering `If-None-Match` with a 304.
 
-    question: str = Field(..., min_length=1, description="Natural-language question to answer")
-    max_search_results: Optional[int] = Field(
-        default=None, ge=1, le=50, description="Override MAX_SEARCH_RESULTS for this request"
+    FileResponse emits an ETag but does not honour conditional requests itself,
+    so passing `stat_result` makes it compute the ETag up front for comparison.
+    """
+    page = FileResponse(
+        _UI_FILE, media_type="text/html", headers=_UI_HEADERS, stat_result=_UI_FILE.stat()
     )
-    max_pages_to_fetch: Optional[int] = Field(
-        default=None, ge=1, le=20, description="Override MAX_PAGES_TO_FETCH for this request"
-    )
-    max_evidence_passages: Optional[int] = Field(
-        default=None, ge=1, le=50, description="Override MAX_EVIDENCE_FOR_MODEL for this request"
-    )
+    etag = page.headers["etag"]
+    candidates = {tag.strip() for tag in request.headers.get("if-none-match", "").split(",")}
+    if etag in candidates or "*" in candidates:
+        return Response(status_code=304, headers={"ETag": etag, **_UI_HEADERS})
+    return page
+
+
+def _parse_accept(header: str) -> Dict[str, tuple]:
+    """Map each explicitly listed media range to `(quality, position)`."""
+    table: Dict[str, tuple] = {}
+    for position, part in enumerate(header.split(",")):
+        segments = [segment.strip() for segment in part.split(";")]
+        media = segments[0].lower()
+        quality = 1.0
+        for param in segments[1:]:
+            if param.startswith("q="):
+                try:
+                    quality = float(param[2:])
+                except ValueError:
+                    quality = 0.0
+        table[media] = (quality, position)
+    return table
+
+
+def wants_html(accept_header: str) -> bool:
+    """True when an Accept header prefers the Web UI over the JSON metadata.
+
+    Split out because it decides what `GET /` returns, and getting it wrong means
+    a browser sees JSON or an API client sees HTML. Browsers send
+    `text/html,application/xhtml+xml,...` with no `application/json` at all, while
+    curl and httpx send `*/*` or `application/json`. So: HTML only when it was
+    explicitly asked for; when both types appear, the higher `q` wins, ties going
+    to whichever was listed first.
+    """
+    table = _parse_accept((accept_header or "").lower())
+    if "text/html" not in table:
+        return False
+    html_quality, html_position = table["text/html"]
+    json_quality, json_position = table.get("application/json", (0.0, len(table)))
+    if html_quality != json_quality:
+        return html_quality > json_quality
+    return html_position < json_position
 
 
 # ==============================================================================
@@ -73,55 +118,141 @@ class AnswerRequest(BaseModel):
 
 
 def create_app() -> FastAPI:
-    """Build the FastAPI application. Kept as a factory so tests can mount it."""
+    """Build the FastAPI gateway. Kept as a factory so tests can mount it."""
     app = FastAPI(
         title="SourceCheck AI",
         description="Autonomous web information retrieval agent with grounded, cited answers.",
-        version="1.0.0",
+        version="1.1.0",
     )
+    # The UI is ~50KB of inline HTML/CSS/JS and compresses ~5x; small JSON is left alone.
+    app.add_middleware(GZipMiddleware, minimum_size=1024)
+
+    @app.get("/livez", include_in_schema=False)
+    def livez() -> Dict[str, str]:
+        """Process liveness for the container HEALTHCHECK - no downstream probes.
+
+        `/health` fans out to the next hop(s) on every call; polling it from
+        Docker every few seconds was pure overhead and log noise, since it
+        never fails on a downstream outage anyway.
+        """
+        return {"status": "ok", "service": "web"}
 
     @app.get("/health")
     def health() -> Dict[str, Any]:
-        """Liveness probe plus a cheap check that the configured model is reachable."""
-        provider = settings.MODEL_PROVIDER.lower().strip()
-        payload: Dict[str, Any] = {
-            "status": "ok",
-            "provider": provider,
-            "search_provider": settings.SEARCH_PROVIDER,
+        """Liveness probe for this gateway, plus whatever the agent reports.
+
+        The agent owns the model/bridge view of the world, so its health payload
+        (provider, search provider, bridge) is merged in when it is reachable -
+        that keeps the Web UI status pill honest without the gateway having to
+        know how the pipeline is wired. When the agent is down the gateway is
+        still alive, so it reports `degraded` rather than failing its own probe.
+        """
+        agent_state = _agent_health()
+        payload: Dict[str, Any] = {"status": "ok", "service": "web", "agent": agent_state}
+
+        body = agent_state.pop("body", None)
+        if agent_state.get("reachable") and isinstance(body, dict):
+            for key in ("provider", "search_provider", "bridge"):
+                if key in body:
+                    payload[key] = body[key]
+            return payload
+
+        payload["status"] = "degraded"
+        # Synthesize the fields the UI's status pill reads, so an unreachable
+        # agent shows "bridge unreachable" instead of a pill stuck on "checking".
+        payload.setdefault("provider", "unknown")
+        payload["bridge"] = {
+            "endpoint": "",
+            "reachable": False,
+            "hint": f"Agent service unreachable at {settings.AGENT_ENDPOINT}",
         }
-
-        if provider == "opencode":
-            payload["bridge"] = _bridge_health()
-
         return payload
 
     @app.get("/")
-    def root() -> Dict[str, Any]:
-        return {
-            "service": "SourceCheck AI",
-            "endpoints": {"health": "/health", "answer": "POST /answer"},
-            "model_provider": settings.MODEL_PROVIDER,
-        }
+    def root(request: Request) -> Response:
+        """`/` is the front door: browsers get the Web UI, API clients get metadata.
+
+        Content negotiation on Accept rather than a redirect, so the URL in the
+        address bar is the URL that answers - and `curl http://host/` still
+        returns the machine-readable service description it always did.
+        """
+        if wants_html(request.headers.get("accept", "")):
+            return _ui_response(request)
+        return JSONResponse(
+            {
+                "service": "SourceCheck AI",
+                "endpoints": {
+                    "health": "/health",
+                    "models": "/models",
+                    "answer": "POST /answer",
+                    "ui": "GET /ui",
+                },
+                "model_provider": settings.MODEL_PROVIDER,
+                "agent": {"endpoint": settings.AGENT_ENDPOINT},
+                "ui": "/ui",
+            }
+        )
+
+    @app.get("/ui", include_in_schema=False)
+    def ui(request: Request) -> Response:
+        """Serve the browser UI. Not in OpenAPI: it is a page, not an API surface."""
+        return _ui_response(request)
+
+    @app.get("/models")
+    def models() -> Response:
+        """Free models the agent can use, fetched through the agent (never the bridge directly)."""
+        try:
+            upstream = _fetch_agent_models()
+        except httpx.HTTPError as exc:
+            logger.error("Agent service unreachable at %s: %s", settings.AGENT_ENDPOINT, exc)
+            raise HTTPException(
+                status_code=503, detail=f"Agent service unreachable at {settings.AGENT_ENDPOINT}"
+            ) from exc
+
+        if upstream.status_code >= 400:
+            raise HTTPException(status_code=upstream.status_code, detail=_upstream_detail(upstream))
+        try:
+            return JSONResponse(content=upstream.json())
+        except ValueError as exc:
+            raise HTTPException(status_code=502, detail="Invalid response from agent service") from exc
 
     @app.post("/answer", response_model=AgentResponse)
-    def answer(req: AnswerRequest) -> AgentResponse:
-        """Run the full pipeline. Declared `def` so FastAPI runs it in its threadpool."""
+    def answer(req: AnswerRequest) -> Response:
+        """Proxy the question to the agent service and pass its response through.
+
+        Validation happens here first (cheap 422s for malformed input), then the
+        agent runs the pipeline. The agent's own error status codes - notably 503
+        for "model backend down" with its precise detail - are preserved so API
+        clients see the same contract they saw when the pipeline ran in-process.
+        """
+        payload = req.model_dump(exclude_none=True)
+
         try:
-            agent = SourceCheckAgent(model=get_model())
-            return agent.answer_question(
-                question=req.question,
-                max_search_results=req.max_search_results,
-                max_pages_to_fetch=req.max_pages_to_fetch,
-                max_evidence_passages=req.max_evidence_passages,
-            )
-        except (ModelError, ModelTimeoutError) as exc:
-            # The model layer already produced a precise message - surface it as a 503
-            # rather than a bare 500, since it almost always means "backend is down".
-            logger.error("Model backend failure: %s", exc)
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("Unhandled failure in /answer")
-            raise HTTPException(status_code=500, detail="Internal agent error") from exc
+            upstream = _call_agent(payload)
+        except httpx.HTTPError as exc:
+            # Connect errors and timeouts both land here: the gateway itself is
+            # healthy, the pipeline behind it is not, which is exactly a 503.
+            logger.error("Agent service unreachable at %s: %s", settings.AGENT_ENDPOINT, exc)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"Agent service unreachable at {settings.AGENT_ENDPOINT} "
+                    f"({exc.__class__.__name__}: {exc})"
+                ),
+            ) from exc
+
+        if upstream.status_code >= 400:
+            detail = _upstream_detail(upstream)
+            # 4xx is the caller's mistake (e.g. an unknown model), not a fault in the stack.
+            level = logging.ERROR if upstream.status_code >= 500 else logging.INFO
+            logger.log(level, "Agent returned HTTP %s: %s", upstream.status_code, detail)
+            raise HTTPException(status_code=upstream.status_code, detail=detail)
+
+        try:
+            return JSONResponse(status_code=upstream.status_code, content=upstream.json())
+        except ValueError as exc:
+            logger.error("Agent returned a non-JSON body: %s", exc)
+            raise HTTPException(status_code=502, detail="Invalid response from agent service") from exc
 
     @app.exception_handler(HTTPException)
     def _json_errors(_request, exc: HTTPException) -> JSONResponse:
@@ -131,40 +262,54 @@ def create_app() -> FastAPI:
     return app
 
 
-def _bridge_health_url() -> str:
-    """Map the OpenAI base URL (.../v1) to the bridge's root /health URL.
+def _agent_health_url() -> str:
+    """Liveness URL of the agent service."""
+    return f"{settings.AGENT_ENDPOINT.rstrip('/')}/health"
 
-    Split out so the (non-obvious) path arithmetic is unit-testable: probing
-    /v1/health 404s and makes a perfectly healthy bridge look down.
+
+def _agent_health() -> Dict[str, Any]:
+    """Probe the agent service. Never raises - health must not fail.
+
+    The raw health body is returned under `body` for the /health route to merge;
+    callers that only care about reachability can ignore it.
     """
-    base = settings.BRIDGE_ENDPOINT.rstrip("/")
-    if base.endswith("/v1"):
-        base = base[: -len("/v1")].rstrip("/")
-    return f"{base}/health"
-
-
-def _bridge_health() -> Dict[str, Any]:
-    """Probe the bridge's liveness endpoint. Never raises - health must not fail."""
-    url = _bridge_health_url()
-
+    endpoint = settings.AGENT_ENDPOINT.rstrip("/")
     try:
         with httpx.Client(timeout=3.0) as client:
-            response = client.get(url)
+            response = client.get(f"{endpoint}/health")
             response.raise_for_status()
             body = response.json()
-        return {
-            "endpoint": settings.BRIDGE_ENDPOINT,
-            "reachable": True,
-            "model": body.get("model", settings.BRIDGE_MODEL),
-            "opencode_version": body.get("opencode_version", "unknown"),
-        }
+        return {"endpoint": endpoint, "reachable": True, "body": body}
     except Exception as exc:  # noqa: BLE001 - diagnostics only
         return {
-            "endpoint": settings.BRIDGE_ENDPOINT,
+            "endpoint": endpoint,
             "reachable": False,
-            "hint": "Start it with: python bridge/opencode_bridge.py",
+            "hint": "Start it with: docker compose up -d",
             "error": str(exc),
         }
+
+
+def _call_agent(payload: Dict[str, Any]) -> httpx.Response:
+    """POST to the agent service. Split out so tests can stub the network hop."""
+    with httpx.Client(timeout=settings.AGENT_TIMEOUT_SECONDS) as client:
+        return client.post(f"{settings.AGENT_ENDPOINT.rstrip('/')}/answer", json=payload)
+
+
+def _fetch_agent_models() -> httpx.Response:
+    """GET the agent's model catalogue. Split out so tests can stub the network hop."""
+    with httpx.Client(timeout=8.0) as client:
+        return client.get(f"{settings.AGENT_ENDPOINT.rstrip('/')}/models")
+
+
+def _upstream_detail(upstream: httpx.Response) -> Any:
+    """Extract the agent's error detail, whatever shape it arrived in."""
+    try:
+        detail = upstream.json().get("detail")
+    except Exception:  # noqa: BLE001 - fall back to raw text
+        detail = None
+    if detail is None:
+        detail = (upstream.text or f"agent returned HTTP {upstream.status_code}").strip()
+    return detail
 
 
 # ASGI entrypoint for `uvicorn main:app`.

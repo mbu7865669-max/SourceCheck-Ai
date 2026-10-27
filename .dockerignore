@@ -1,0 +1,26 @@
+# VCS and editor noise
+.git/
+.gitignore
+.idea/
+.vscode/
+
+# Python caches and virtualenvs
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+venv/
+.venv/
+env/
+
+# Local runtime state and secrets
+.env
+*.log
+
+# Local-only artifacts that don't belong in the image
+test-results.txt
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

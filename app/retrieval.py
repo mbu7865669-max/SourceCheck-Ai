@@ -166,6 +166,60 @@ def validate_url(url: str, block_ssrf: bool = True) -> str:
 # ==============================================================================
 
 
+_UNWANTED_TAGS = [
+    "script", "style", "noscript", "template", "nav", "footer", "header", "aside",
+    "form", "svg", "iframe", "button", "select", "img", "picture", "video",
+    "audio", "source", "canvas", "dialog", "menu",
+]
+
+_BLOCK_TAGS = [
+    "p", "div", "section", "article", "main", "li", "ul", "ol", "dl", "dt", "dd",
+    "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "table", "tr", "td",
+    "th", "figure", "figcaption", "hr", "address",
+]
+
+_BOILERPLATE_ROLES = frozenset(
+    {"navigation", "banner", "contentinfo", "complementary", "search", "menu", "menubar", "dialog"}
+)
+
+# Whole class/id tokens (split on - and _) that mark site chrome, not content.
+_BOILERPLATE_TOKEN = re.compile(
+    r"(?:^|[-_])(?:nav|navbar|navigation|menu|sidebar|breadcrumbs?|cookies?|"
+    r"footer|social|share|sharing|newsletter|popup|modal|advert|advertisement|"
+    r"ads?|promo|skip|toolbar)(?:[-_]|$)",
+    re.IGNORECASE,
+)
+
+_KEEP_TAGS = frozenset({"html", "body", "main", "article"})
+
+
+def _is_boilerplate(tag: "bs4.element.Tag") -> bool:
+    """True for elements that are hidden or clearly navigation / site chrome."""
+    if not isinstance(tag, bs4.element.Tag) or tag.name in _KEEP_TAGS or tag.attrs is None:
+        return False
+    if tag.get("role", "").strip().lower() in _BOILERPLATE_ROLES:
+        return True
+    if tag.has_attr("hidden") or tag.get("aria-hidden", "").strip().lower() == "true":
+        return True
+    tokens = list(tag.get("class") or [])
+    if tag.get("id"):
+        tokens.append(tag.get("id"))
+    return any(_BOILERPLATE_TOKEN.search(str(token)) for token in tokens)
+
+
+def _main_content_root(soup: "bs4.BeautifulSoup") -> "bs4.element.Tag":
+    """The largest <main> / [role=main] / <article> with real text, else <body>."""
+    candidates = soup.find_all(["main", "article"]) + soup.find_all(attrs={"role": "main"})
+    best, best_len = None, 0
+    for candidate in candidates:
+        length = len(candidate.get_text(" ", strip=True))
+        if length > best_len:
+            best, best_len = candidate, length
+    if best is not None and best_len >= 200:
+        return best
+    return soup.body or soup
+
+
 def clean_html(html_content: str, max_text_length: int = 50000) -> Tuple[str, str]:
     """
     Extract page title and readable plain text from raw HTML content using BeautifulSoup.
@@ -198,33 +252,35 @@ def clean_html(html_content: str, max_text_length: int = 50000) -> Tuple[str, st
         soup.title.decompose()
 
     # Strip script, style, navigation, media, and boilerplate tags
-    unwanted_tags = [
-        "script",
-        "style",
-        "noscript",
-        "nav",
-        "footer",
-        "header",
-        "aside",
-        "form",
-        "svg",
-        "iframe",
-        "button",
-        "img",
-        "picture",
-        "video",
-        "audio",
-        "source",
-        "canvas",
-    ]
-    for tag in soup.find_all(unwanted_tags):
+    for tag in soup.find_all(_UNWANTED_TAGS):
         tag.decompose()
 
-    # Extract text with line breaks preserved between sections
-    raw_text = soup.get_text(separator="\n", strip=True)
+    # Strip landmark / hidden / site-chrome containers (menus, sidebars, cookie bars).
+    for tag in soup.find_all(_is_boilerplate):
+        tag.decompose()
 
-    # Collapse excessive blank lines
-    cleaned_text = re.sub(r"\n{3,}", "\n\n", raw_text).strip()
+    # Prefer the page's main content region when it has one with real text,
+    # so headers, mega-menus and "word of the day" sidebars never reach scoring.
+    root = _main_content_root(soup)
+
+    # Paragraph breaks between block elements, line breaks for <br>, so the
+    # passage splitter sees real paragraphs instead of one page-long blob.
+    for br in root.find_all("br"):
+        br.replace_with("\n")
+    for block in root.find_all(_BLOCK_TAGS):
+        block.insert_before("\n\n")
+        block.insert_after("\n\n")
+
+    raw_text = root.get_text(separator=" ")
+    blocks = []
+    for chunk in re.split(r"\n\s*\n", raw_text):
+        lines = [re.sub(r"[ \t\r\f\v]+", " ", line).strip() for line in chunk.split("\n")]
+        # Inline tags are joined with a space; drop the one that lands before punctuation.
+        lines = [re.sub(r" +([,.;:!?)\]])", r"\1", line) for line in lines]
+        text_block = "\n".join(line for line in lines if line)
+        if text_block:
+            blocks.append(text_block)
+    cleaned_text = "\n\n".join(blocks).strip()
 
     # Bound maximum text length
     if len(cleaned_text) > max_text_length:
@@ -236,6 +292,27 @@ def clean_html(html_content: str, max_text_length: int = 50000) -> Tuple[str, st
 # ==============================================================================
 # Web Page Fetching
 # ==============================================================================
+
+# Statuses that mean "this host refuses *us*" - bot / IP / rate-limit / legal
+# protection - rather than "this fetch broke". Expected during bulk retrieval, so
+# the agent reports them as informational notices: a single blocked source must
+# not read as a failure when other sources answered the question.
+BLOCKED_STATUSES = frozenset({401, 403, 429, 451})
+
+
+def is_blocked_status(status_code: Optional[int]) -> bool:
+    """True when a non-200 means the site refused the request, not that it failed."""
+    return status_code in BLOCKED_STATUSES
+
+
+def describe_http_status(status_code: int) -> str:
+    """Human-readable, non-alarming wording for a non-200 response."""
+    if status_code in BLOCKED_STATUSES:
+        return (
+            f"HTTP {status_code} - the site refused the request "
+            "(bot/IP protection); page skipped."
+        )
+    return f"HTTP request returned status {status_code}."
 
 
 def fetch_page(
@@ -373,7 +450,7 @@ def fetch_page(
                 final_url=current_url,
                 status_code=response.status_code,
                 success=False,
-                error=f"HTTP request returned status {response.status_code}.",
+                error=describe_http_status(response.status_code),
             )
 
         # Check Content-Type header

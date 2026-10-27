@@ -104,7 +104,12 @@ class TestModelFactory:
 
 
 class TestBridgeConfiguration:
-    def test_default_endpoint_model_and_timeout(self):
+    def test_default_endpoint_model_and_timeout(self, monkeypatch):
+        # The factory reads settings at call time, so an ambient BRIDGE_ENDPOINT
+        # (docker-compose points the web service at http://bridge:18383/v1) would
+        # otherwise mask the documented defaults this test exists to pin down.
+        monkeypatch.setattr(settings, "BRIDGE_ENDPOINT", BRIDGE_URL)
+        monkeypatch.setattr(settings, "BRIDGE_MODEL", "opencode/mimo-v2.6-flash-free")
         llm = OpenCodeBridgeLLM(transport=httpx.MockTransport(ok_handler()))
         assert llm.endpoint == BRIDGE_URL
         assert llm.model_name == "opencode/mimo-v2.6-flash-free"
